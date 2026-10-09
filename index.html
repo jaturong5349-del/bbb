@@ -1,0 +1,532 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>เกมคำต้องห้าม Multiplayer (ทาบหน้าผาก)</title>
+  
+  <!-- CSS Framework (Tailwind) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <!-- Fonts -->
+  <link href="https://fonts.googleapis.com/css2?family=Kanit:wght@300;400;700;900&display=swap" rel="stylesheet">
+  
+  <!-- React & ReactDOM -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  
+  <!-- Babel for JSX -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  
+  <!-- PeerJS for Free Multiplayer WebRTC -->
+  <script src="https://unpkg.com/peerjs@1.5.1/dist/peerjs.min.js"></script>
+
+  <style>
+    body {
+      font-family: 'Kanit', sans-serif;
+      background-color: #3b0764; /* Tailwind purple-950 */
+      color: white;
+      margin: 0;
+      padding: 0;
+      overflow-x: hidden;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    const CATEGORIES = {
+      'คำพูดติดปาก': ['ไม่รู้', 'อะไรนะ', 'เออ', 'ใช่', 'ไม่', 'เดี๋ยว', 'จริงป่ะ', 'ทำไม', 'โอเค', 'อ้าว', 'คือแบบ', 'ก็'],
+      'อาการความรู้สึก': ['หิว', 'เหนื่อย', 'ง่วง', 'ร้อน', 'หนาว', 'ปวดหัว', 'อิ่ม', 'เบื่อ', 'โกรธ', 'ตื่นเต้น'],
+      'กริยาท่าทาง': ['กิน', 'นอน', 'เดิน', 'วิ่ง', 'นั่ง', 'หัวเราะ', 'ร้องไห้', 'ยิ้ม', 'มอง', 'พูด', 'ฟัง'],
+      'คำอุทาน': ['อุ๊ย', 'โอ๊ย', 'เอ๊ะ', 'ว้าย', 'เฮ้ย', 'อ้าว', 'โห', 'อืม', 'เย้', 'ปัดโธ่'],
+    };
+
+    const ROOM_PREFIX = 'th-fbg-'; // Prefix to avoid PeerJS ID collisions
+
+    function App() {
+      // User Identity
+      const [playerName, setPlayerName] = useState('');
+      const [myUid, setMyUid] = useState('');
+      const [isHost, setIsHost] = useState(false);
+      
+      // Game State
+      const [localState, setLocalState] = useState('home'); // home, lobby, countdown, playing
+      const [roomCode, setRoomCode] = useState('');
+      const [roomCodeInput, setRoomCodeInput] = useState('');
+      const [errorMsg, setErrorMsg] = useState('');
+      const [countdown, setCountdown] = useState(3);
+      const [isLoading, setIsLoading] = useState(false);
+
+      // Shared State (Synchronized across peers)
+      const [roomData, setRoomData] = useState(null); 
+      
+      // Refs for WebRTC Networking
+      const peerRef = useRef(null);
+      const connRef = useRef(null); // For client to talk to host
+      const hostConnsRef = useRef([]); // For host to talk to clients
+      const roomDataRef = useRef(null); // Source of truth for Host
+
+      // Generate cute random names on mount
+      useEffect(() => {
+        const randomNames = ['มะม่วง', 'ทุเรียน', 'มังคุด', 'กะเพรา', 'หมูปิ้ง', 'ชาไข่มุก'];
+        setPlayerName(randomNames[Math.floor(Math.random() * randomNames.length)] + Math.floor(Math.random() * 99));
+      }, []);
+
+      // Handle transitions triggered by network state changes
+      useEffect(() => {
+        if (!roomData) return;
+        
+        if (roomData.status === 'playing' && localState === 'lobby') {
+          setLocalState('countdown');
+          setCountdown(3);
+        } else if (roomData.status === 'waiting' && localState !== 'lobby') {
+          setLocalState('lobby');
+        }
+      }, [roomData, localState]);
+
+      // Countdown logic
+      useEffect(() => {
+        let timer;
+        if (localState === 'countdown' && countdown > 0) {
+          timer = setTimeout(() => setCountdown(c => c - 1), 1000);
+        } else if (localState === 'countdown' && countdown === 0) {
+          setLocalState('playing');
+        }
+        return () => clearTimeout(timer);
+      }, [localState, countdown]);
+
+      // Host uses this function to update state and broadcast to everyone
+      const updateAndBroadcastState = (updater) => {
+        const currentState = roomDataRef.current || {};
+        const newState = typeof updater === 'function' ? updater(currentState) : updater;
+        
+        roomDataRef.current = newState;
+        setRoomData(newState); // Update UI
+        
+        // Broadcast to all connected clients
+        hostConnsRef.current.forEach(conn => {
+          if (conn.open) {
+            conn.send({ type: 'STATE_UPDATE', state: newState });
+          }
+        });
+      };
+
+      const createRoom = () => {
+        if (!playerName.trim()) return;
+        setErrorMsg('');
+        setIsLoading(true);
+
+        const code = Math.floor(1000 + Math.random() * 9000).toString(); // 4 digits
+        const fullPeerId = ROOM_PREFIX + code;
+        
+        const peer = new Peer(fullPeerId);
+        peerRef.current = peer;
+
+        peer.on('open', (id) => {
+          setIsLoading(false);
+          setRoomCode(code);
+          setIsHost(true);
+          setMyUid(id);
+          
+          const initialState = {
+            status: 'waiting', // waiting, playing
+            category: Object.keys(CATEGORIES)[0],
+            players: {
+              [id]: { name: playerName, word: '', isOut: false, isHost: true }
+            }
+          };
+          updateAndBroadcastState(initialState);
+          setLocalState('lobby');
+        });
+
+        peer.on('connection', (conn) => {
+          // Handle incoming connection from a client
+          conn.on('open', () => {
+            hostConnsRef.current.push(conn);
+          });
+
+          conn.on('data', (data) => {
+            if (!roomDataRef.current) return;
+            
+            // Client joined
+            if (data.type === 'JOIN') {
+              updateAndBroadcastState(prev => ({
+                ...prev,
+                players: {
+                  ...prev.players,
+                  [data.uid]: { name: data.name, word: '', isOut: false, isHost: false }
+                }
+              }));
+            }
+            
+            // Client got eliminated
+            if (data.type === 'ELIMINATE') {
+              updateAndBroadcastState(prev => ({
+                ...prev,
+                players: {
+                  ...prev.players,
+                  [data.uid]: { ...prev.players[data.uid], isOut: true }
+                }
+              }));
+            }
+          });
+
+          conn.on('close', () => {
+             // Optional: Handle disconnect (remove player)
+             hostConnsRef.current = hostConnsRef.current.filter(c => c.peer !== conn.peer);
+          });
+        });
+
+        peer.on('error', (err) => {
+          setIsLoading(false);
+          console.error(err);
+          if (err.type === 'unavailable-id') {
+            setErrorMsg('รหัสห้องนี้ซ้ำ กรุณากดสร้างใหม่อีกครั้ง');
+          } else {
+            setErrorMsg('เกิดข้อผิดพลาดในการสร้างห้อง: ' + err.type);
+          }
+        });
+      };
+
+      const joinRoom = () => {
+        if (!playerName.trim() || !roomCodeInput.trim()) return;
+        setErrorMsg('');
+        setIsLoading(true);
+
+        const peer = new Peer(); // Random ID for client
+        peerRef.current = peer;
+
+        peer.on('open', (id) => {
+          setMyUid(id);
+          const targetHostId = ROOM_PREFIX + roomCodeInput.trim();
+          
+          const conn = peer.connect(targetHostId);
+          connRef.current = conn;
+
+          conn.on('open', () => {
+            setIsLoading(false);
+            setRoomCode(roomCodeInput.trim());
+            setIsHost(false);
+            
+            // Tell host we joined
+            conn.send({ type: 'JOIN', name: playerName, uid: id });
+            setLocalState('lobby');
+          });
+
+          conn.on('data', (data) => {
+            if (data.type === 'STATE_UPDATE') {
+              setRoomData(data.state);
+            }
+          });
+
+          conn.on('close', () => {
+            setErrorMsg('ห้องถูกปิดแล้ว');
+            leaveRoom();
+          });
+        });
+
+        peer.on('error', (err) => {
+          setIsLoading(false);
+          console.error(err);
+          if (err.type === 'peer-unavailable') {
+            setErrorMsg('ไม่พบรหัสห้องนี้ (หัวหน้าห้องอาจออกไปแล้ว)');
+          } else {
+            setErrorMsg('เชื่อมต่อไม่สำเร็จ: ' + err.type);
+          }
+        });
+      };
+
+      const startGame = () => {
+        if (!isHost || !roomDataRef.current) return;
+        
+        const currentData = roomDataRef.current;
+        const uids = Object.keys(currentData.players);
+        const cat = currentData.category;
+        
+        const words = [...CATEGORIES[cat]].sort(() => Math.random() - 0.5);
+        
+        const updatedPlayers = { ...currentData.players };
+        uids.forEach((uid, index) => {
+          updatedPlayers[uid] = {
+             ...updatedPlayers[uid],
+             word: words[index % words.length],
+             isOut: false
+          };
+        });
+
+        updateAndBroadcastState({
+          ...currentData,
+          status: 'playing',
+          players: updatedPlayers
+        });
+      };
+
+      const eliminateMe = () => {
+        if (isHost) {
+          updateAndBroadcastState(prev => ({
+            ...prev,
+            players: {
+              ...prev.players,
+              [myUid]: { ...prev.players[myUid], isOut: true }
+            }
+          }));
+        } else {
+          // Send to host
+          if (connRef.current && connRef.current.open) {
+            connRef.current.send({ type: 'ELIMINATE', uid: myUid });
+          }
+        }
+      };
+
+      const resetToLobby = () => {
+        if (isHost && roomDataRef.current) {
+          updateAndBroadcastState(prev => ({ ...prev, status: 'waiting' }));
+        }
+      };
+
+      const leaveRoom = () => {
+        if (peerRef.current) peerRef.current.destroy();
+        peerRef.current = null;
+        connRef.current = null;
+        hostConnsRef.current = [];
+        roomDataRef.current = null;
+        
+        setRoomCode('');
+        setRoomData(null);
+        setIsHost(false);
+        setLocalState('home');
+      };
+
+      const renderHome = () => (
+        <div className="flex flex-col items-center justify-center p-6 w-full max-w-md mx-auto space-y-6 min-h-screen">
+          <div className="bg-purple-900 p-8 rounded-3xl shadow-2xl shadow-purple-900/50 w-full border border-purple-700 text-center relative overflow-hidden">
+            
+            <div className="absolute -top-10 -right-10 w-32 h-32 bg-pink-500 rounded-full blur-3xl opacity-30 animate-pulse"></div>
+
+            <h1 className="text-4xl font-black text-white mb-2 tracking-tight relative z-10">
+              คำ<span className="text-pink-400">ต้อง</span>ห้าม
+            </h1>
+            <div className="inline-block bg-pink-600 text-white text-xs font-bold px-3 py-1 rounded-full mb-8 shadow-lg transform -rotate-2">
+              โหมด: แปะหน้าผาก (Online P2P)
+            </div>
+
+            <div className="space-y-5 relative z-10 text-left">
+              {errorMsg && (
+                <div className="bg-red-900/50 border border-red-500 text-red-200 p-3 rounded-xl text-sm text-center">
+                  {errorMsg}
+                </div>
+              )}
+
+              <div>
+                <label className="block text-purple-200 text-sm font-bold mb-2">ชื่อของคุณ:</label>
+                <input 
+                  type="text" 
+                  className="w-full bg-purple-950/80 border-2 border-purple-600 text-white rounded-xl p-4 outline-none focus:border-pink-500 font-bold text-center text-xl transition-all"
+                  value={playerName}
+                  onChange={(e) => setPlayerName(e.target.value)}
+                  placeholder="ตั้งชื่อเท่ๆ..."
+                />
+              </div>
+
+              <div className="pt-4 border-t border-purple-800 space-y-4">
+                <button 
+                  onClick={createRoom}
+                  disabled={isLoading}
+                  className="w-full bg-gradient-to-r from-pink-600 to-purple-600 hover:from-pink-500 hover:to-purple-500 text-white font-black py-4 px-8 rounded-2xl shadow-xl transition-transform transform active:scale-95 text-lg disabled:opacity-50"
+                >
+                  {isLoading && isHost ? 'กำลังสร้าง...' : '👑 สร้างห้องใหม่ (เป็นหัวหน้า)'}
+                </button>
+                
+                <div className="flex items-center space-x-2">
+                  <input 
+                    type="text" 
+                    className="flex-1 bg-purple-950/80 border-2 border-purple-600 text-white rounded-xl p-4 outline-none focus:border-blue-500 font-bold text-center text-xl tracking-widest placeholder:tracking-normal placeholder:text-sm"
+                    value={roomCodeInput}
+                    onChange={(e) => setRoomCodeInput(e.target.value.toUpperCase())}
+                    placeholder="พิมพ์รหัส 4 หลัก"
+                    maxLength={4}
+                  />
+                  <button 
+                    onClick={joinRoom}
+                    disabled={isLoading}
+                    className="bg-blue-600 hover:bg-blue-500 text-white font-bold py-4 px-6 rounded-xl shadow-lg transition-transform transform active:scale-95 whitespace-nowrap disabled:opacity-50"
+                  >
+                    {isLoading && !isHost ? 'กำลังเข้า...' : 'เข้าห้อง'}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+
+      const renderLobby = () => {
+        if (!roomData) return null;
+        const playersList = Object.values(roomData.players);
+
+        return (
+          <div className="flex flex-col items-center justify-center p-6 w-full max-w-md mx-auto min-h-screen">
+            <div className="bg-purple-900 p-8 rounded-3xl shadow-2xl w-full border border-purple-700 flex flex-col items-center relative">
+              
+              <button onClick={leaveRoom} className="absolute top-4 left-4 text-purple-400 hover:text-white bg-purple-950 p-2 rounded-lg text-sm">
+                ← ออก
+              </button>
+
+              <h2 className="text-xl text-purple-300 font-medium mb-1 mt-6">รหัสเข้าห้อง</h2>
+              <div className="text-6xl font-black text-white tracking-[0.2em] mb-8 bg-purple-950 px-6 py-4 rounded-2xl border-2 border-pink-500 shadow-inner">
+                {roomCode}
+              </div>
+
+              <div className="w-full bg-purple-950/50 p-4 rounded-2xl mb-8 border border-purple-800">
+                <h3 className="text-sm font-bold text-pink-400 mb-3 uppercase tracking-wider text-left">ผู้เล่นที่รออยู่ ({playersList.length}):</h3>
+                <div className="flex flex-wrap gap-2">
+                  {playersList.map((p, idx) => (
+                    <div key={idx} className="bg-purple-800 text-white px-4 py-2 rounded-xl font-medium border border-purple-600 shadow-sm flex items-center space-x-2">
+                      <span>{p.name}</span>
+                      {p.name === playerName && <span className="text-xs bg-pink-500 px-2 py-0.5 rounded-full">เรา</span>}
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {isHost ? (
+                <div className="w-full space-y-4">
+                  <div className="text-left">
+                    <label className="block text-purple-200 text-sm font-bold mb-2">หัวหน้าห้อง เลือกหมวดหมู่:</label>
+                    <select 
+                      className="w-full bg-purple-950 border-2 border-purple-600 text-white rounded-xl p-4 outline-none focus:border-pink-500 font-medium text-lg"
+                      value={roomData.category}
+                      onChange={(e) => updateAndBroadcastState(prev => ({ ...prev, category: e.target.value }))}
+                    >
+                      {Object.keys(CATEGORIES).map(cat => (
+                        <option key={cat} value={cat}>{cat}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <button 
+                    onClick={startGame}
+                    disabled={playersList.length < 2}
+                    className={`w-full font-black py-4 px-8 rounded-2xl shadow-xl transition-all transform active:scale-95 text-xl tracking-wide ${
+                      playersList.length < 2 
+                        ? 'bg-gray-600 text-gray-400 cursor-not-allowed' 
+                        : 'bg-gradient-to-r from-pink-600 to-purple-600 text-white'
+                    }`}
+                  >
+                    {playersList.length < 2 ? 'รอเพื่อนเข้าห้อง...' : 'เริ่มเกม!'}
+                  </button>
+                </div>
+              ) : (
+                <div className="w-full bg-purple-800/50 p-6 rounded-2xl text-center border border-purple-600 animate-pulse">
+                  <p className="text-purple-200 text-lg">กำลังรอหัวหน้าห้องกดเริ่มเกม...</p>
+                  <p className="text-sm text-pink-300 mt-2">หมวด: {roomData.category}</p>
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      };
+
+      const renderCountdown = () => (
+        <div className="fixed inset-0 bg-black z-50 flex flex-col items-center justify-center p-6 text-center">
+          <div className="animate-bounce mb-8">
+            <svg className="w-24 h-24 text-pink-500 mx-auto" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z"></path>
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 5l-3-3-3 3"></path>
+            </svg>
+          </div>
+          <h2 className="text-4xl font-black text-white mb-4 leading-tight">
+            เตรียมตัว!<br/>หลับตาแล้วเอาทาบหน้าผากเลย
+          </h2>
+          <p className="text-pink-400 text-xl font-bold mb-12">ห้ามแอบดูจอนะ!</p>
+          
+          <div className="text-[12rem] font-black text-white leading-none">
+            {countdown}
+          </div>
+        </div>
+      );
+
+      const renderPlaying = () => {
+        if (!roomData) return null;
+        const myData = roomData.players[myUid];
+        
+        if (myData?.isOut) {
+          return (
+            <div className="flex flex-col items-center justify-center min-h-screen p-6 w-full max-w-md mx-auto text-center">
+              <div className="bg-red-900/80 p-8 rounded-3xl w-full border-4 border-red-500 shadow-[0_0_50px_rgba(239,68,68,0.5)]">
+                <div className="text-6xl mb-4">😵</div>
+                <h2 className="text-4xl font-black text-white mb-2">คุณแพ้แล้ว!</h2>
+                <p className="text-red-200 text-lg mb-8">คุณเผลอพูดคำว่า</p>
+                <div className="text-5xl font-black text-white bg-red-950 p-6 rounded-2xl mb-8 break-words">
+                  "{myData.word}"
+                </div>
+                <p className="text-gray-300 text-sm bg-black/30 p-4 rounded-xl">ช่วยเพื่อนจับผิดคนที่เหลือต่อเลย หรือรอหัวหน้าเริ่มรอบใหม่</p>
+                
+                {isHost && (
+                   <button onClick={resetToLobby} className="mt-8 bg-purple-600 hover:bg-purple-500 text-white font-bold py-3 px-6 rounded-xl w-full transition-colors">
+                     กลับหน้าล็อบบี้
+                   </button>
+                )}
+              </div>
+            </div>
+          );
+        }
+
+        return (
+          <div className="fixed inset-0 bg-white z-50 flex flex-col items-center justify-between p-6">
+            <div className="flex-1 flex flex-col items-center justify-center w-full">
+              <div className="text-gray-400 font-bold text-xl uppercase tracking-widest mb-4">
+                คำต้องห้ามของ {myData?.name} คือ
+              </div>
+              <div className="text-[15vw] md:text-[8rem] font-black text-black leading-none text-center break-words w-full px-4 drop-shadow-md">
+                {myData?.word}
+              </div>
+            </div>
+
+            <div className="w-full max-w-md mb-8">
+               <div className="bg-red-50 p-4 rounded-2xl border-2 border-red-200 text-center shadow-inner mb-4">
+                 <p className="text-red-500 font-bold text-sm">⚠️ ถ้าเพื่อนชี้หน้าแล้วบอกว่าคุณพูดคำบนหน้าจอ ให้กดปุ่มนี้</p>
+               </div>
+               <button 
+                onClick={eliminateMe}
+                className="w-full bg-red-600 hover:bg-red-500 text-white font-black py-6 px-8 rounded-3xl shadow-2xl transition-transform transform active:scale-95 text-2xl"
+              >
+                ฉันยอมแพ้ (เผลอพูดไปแล้ว)
+              </button>
+            </div>
+
+            {isHost && (
+              <button onClick={resetToLobby} className="absolute top-6 left-6 text-gray-400 bg-gray-100 px-4 py-2 rounded-full font-bold shadow active:scale-95">
+                จบเกม (กลับล็อบบี้)
+              </button>
+            )}
+          </div>
+        );
+      };
+
+      return (
+        <div className="min-h-screen">
+          {/* Background decoration */}
+          <div className="fixed inset-0 overflow-hidden pointer-events-none">
+            <div className="absolute top-[-10%] left-[-10%] w-96 h-96 bg-purple-600 rounded-full mix-blend-multiply filter blur-[120px] opacity-50"></div>
+            <div className="absolute bottom-[-10%] right-[-10%] w-96 h-96 bg-pink-600 rounded-full mix-blend-multiply filter blur-[120px] opacity-40"></div>
+          </div>
+
+          <div className="relative z-10 w-full">
+            {localState === 'home' && renderHome()}
+            {localState === 'lobby' && renderLobby()}
+            {localState === 'countdown' && renderCountdown()}
+            {localState === 'playing' && renderPlaying()}
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
